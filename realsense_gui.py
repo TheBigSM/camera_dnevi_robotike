@@ -1,6 +1,7 @@
 import threading
 import time
 from datetime import datetime
+import os
 
 import numpy as np
 import pyrealsense2 as rs
@@ -16,6 +17,9 @@ config = rs.config()
 config.enable_stream(rs.stream.depth,    640, 480, rs.format.z16,  15)
 config.enable_stream(rs.stream.infrared, 1, 640, 480, rs.format.y8, 15)
 config.enable_stream(rs.stream.infrared, 2, 640, 480, rs.format.y8, 15)
+config.enable_stream(rs.stream.color,    640, 480, rs.format.rgb8, 15)
+
+align = rs.align(rs.stream.depth)  # reproject color into depth camera frame
 
 
 def depth_to_rgb(depth_frame, vmin=0, vmax=3000):
@@ -52,14 +56,17 @@ class RealSenseApp:
         tk.Label(frame_images, text="IR Left",  **label_style).grid(row=0, column=0, padx=4)
         tk.Label(frame_images, text="IR Right", **label_style).grid(row=0, column=1, padx=4)
         tk.Label(frame_images, text="Depth",    **label_style).grid(row=0, column=2, padx=4)
+        tk.Label(frame_images, text="Color",    **label_style).grid(row=0, column=3, padx=4)
 
         self.canvas_ir_left  = tk.Label(frame_images, bg="black")
         self.canvas_ir_right = tk.Label(frame_images, bg="black")
         self.canvas_depth    = tk.Label(frame_images, bg="black")
+        self.canvas_color    = tk.Label(frame_images, bg="black")
 
         self.canvas_ir_left .grid(row=1, column=0, padx=4, pady=4)
         self.canvas_ir_right.grid(row=1, column=1, padx=4, pady=4)
         self.canvas_depth   .grid(row=1, column=2, padx=4, pady=4)
+        self.canvas_color   .grid(row=1, column=3, padx=4, pady=4)
 
         # Status bar
         self.status_var = tk.StringVar(value="Idle")
@@ -85,7 +92,7 @@ class RealSenseApp:
         self.btn_cap  .grid(row=0, column=2, padx=6)
 
         self._blank = self._make_blank()
-        for c in (self.canvas_ir_left, self.canvas_ir_right, self.canvas_depth):
+        for c in (self.canvas_ir_left, self.canvas_ir_right, self.canvas_depth, self.canvas_color):
             c.configure(image=self._blank)
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -130,26 +137,29 @@ class RealSenseApp:
     def _stream_loop(self):
         while self.running:
             try:
-                frames = pipeline.wait_for_frames(timeout_ms=30000)
+                raw_frames = pipeline.wait_for_frames(timeout_ms=30000)
             except RuntimeError:
                 break
 
-            ir_left  = np.asanyarray(frames.get_infrared_frame(1).get_data())
-            ir_right = np.asanyarray(frames.get_infrared_frame(2).get_data())
-            depth    = np.asanyarray(frames.get_depth_frame().get_data())
+            ir_left  = np.asanyarray(raw_frames.get_infrared_frame(1).get_data())
+            ir_right = np.asanyarray(raw_frames.get_infrared_frame(2).get_data())
+            depth    = np.asanyarray(raw_frames.get_depth_frame().get_data())
+            color_frame = raw_frames.get_color_frame()
+            color    = np.asanyarray(color_frame.get_data()) if color_frame else None
 
             with self.lock:
-                self.latest_frames = (ir_left, ir_right, depth)
+                self.latest_frames = (ir_left, ir_right, depth, color)
 
             if self.capture_requested:
                 self.capture_requested = False
-                self._save_capture(ir_left, ir_right, depth)
+                self._save_capture(ir_left, ir_right, depth, color)
 
             # Push update to GUI thread
             tk_il = self._array_to_tk(gray_to_rgb(ir_left))
             tk_ir = self._array_to_tk(gray_to_rgb(ir_right))
             tk_d  = self._array_to_tk(depth_to_rgb(depth))
-            self.root.after(0, self._update_canvases, tk_il, tk_ir, tk_d)
+            tk_c  = self._array_to_tk(color) if color is not None else self._blank
+            self.root.after(0, self._update_canvases, tk_il, tk_ir, tk_d, tk_c)
 
         # Stream ended
         try:
@@ -158,11 +168,12 @@ class RealSenseApp:
             pass
         self.root.after(0, self._on_stream_stopped)
 
-    def _update_canvases(self, tk_il, tk_ir, tk_d):
+    def _update_canvases(self, tk_il, tk_ir, tk_d, tk_c):
         # Hold references so GC doesn't collect them
         self.canvas_ir_left .configure(image=tk_il); self.canvas_ir_left ._img = tk_il
         self.canvas_ir_right.configure(image=tk_ir); self.canvas_ir_right._img = tk_ir
         self.canvas_depth   .configure(image=tk_d);  self.canvas_depth   ._img = tk_d
+        self.canvas_color   .configure(image=tk_c);  self.canvas_color   ._img = tk_c
 
     def _on_stream_stopped(self):
         self.btn_start.configure(state="normal")
@@ -180,17 +191,18 @@ class RealSenseApp:
         self.capture_requested = True
         self.status_var.set("Capture queued…")
 
-    def _save_capture(self, ir_left, ir_right, depth):
-        import os
-        os.makedirs("data", exist_ok=True)
+    def _save_capture(self, ir_left, ir_right, depth, color=None):
+        os.makedirs("data/area", exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        Image.fromarray(ir_left) .save(f"data/capture_{ts}_ir_left.png")
-        Image.fromarray(ir_right).save(f"data/capture_{ts}_ir_right.png")
-        Image.fromarray(depth_to_rgb(depth)).save(f"data/capture_{ts}_depth.png")
-        np.save(f"data/capture_{ts}_depth_raw.npy", depth)
+        Image.fromarray(ir_left).save(f"data/area/capture_{ts}_ir_left.png")
+        Image.fromarray(ir_right).save(f"data/area/capture_{ts}_ir_right.png")
+        Image.fromarray(depth_to_rgb(depth)).save(f"data/area/capture_{ts}_depth.png")
+        np.save(f"data/area/capture_{ts}_depth_raw.npy", depth)
+        if color is not None:
+            Image.fromarray(color).save(f"data/area/capture_{ts}_color.png")
 
-        msg = f"Saved data/capture_{ts}_*.png"
+        msg = f"Saved data/area/capture_{ts}_*.png"
         print(msg)
         self.root.after(0, lambda: self.status_var.set(msg))
 
