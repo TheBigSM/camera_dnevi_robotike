@@ -1,360 +1,369 @@
 """
-Hackathon Calibration Script
-============================
-Collects reference points by physically moving the robot and computes the
-camera→end-effector transform (T_cam_to_ee) needed by motor_grasp_pipeline.py.
+Motor Grasp Pipeline — Manual Calibration
+==========================================
+Calibrates the two image-to-robot mappings needed by motor_grasp_pipeline.py.
+No robot SDK required: all robot coordinates are typed in manually.
 
-Math
-----
-At each repetition i the robot is at the overhead position with known pose
-T_ee_to_base_i (forward kinematics). The depth camera detects the motor at
-point p_cam_i in the camera frame. The user then jogs the robot TCP to
-exactly the motor centre and saves that pose p_grasp_i in the robot base frame.
+What gets calibrated
+--------------------
+Two 2-D affine transforms and one angle offset:
 
-We need R_ce, t_ce (camera→EE rotation and translation) such that:
-    T_ee_to_base_i @ (R_ce @ p_cam_i + t_ce) ≈ p_grasp_i
+  T_depth  : depth image pixel (u, v)  →  robot XY for close-up positioning
+  T_rgb    : RGB image pixel  (cx, cy) →  robot XY for grasp positioning
+  angle_offset_deg : image_angle + offset ≈ robot last-joint angle at grasp
 
-Rearranging: R_ce @ p_cam_i + t_ce ≈ T_base_to_ee_i @ p_grasp_i = q_i
+Z heights (close-up and grasp) are fixed and averaged across repetitions.
 
-So we collect pairs (p_cam_i, q_i) and run Kabsch/SVD to get R_ce, t_ce.
-Three non-colinear pairs fully determine the rigid transform.
-More pairs reduce noise — aim for 4–6 if time allows.
+All results are saved to calibration/transforms.json and can be loaded by
+motor_grasp_pipeline.py once robot communication is available.
 
-Procedure per repetition
--------------------------
-Step 1  Move robot to the fixed overhead position.
-        Script captures depth, detects motor, records p_cam.
-Step 2  Move robot directly above the motor at RGB-scan height.
-        Script captures RGB, detects centroid (cross-check / used for
-        mounting_offset_deg estimation).
-Step 3  Jog the robot TCP to the exact motor centre at table height.
-        Script reads and saves the TCP pose (= ground truth p_grasp).
+Procedure
+---------
+Setup (once):
+  Move robot to the fixed top position and type in its coordinates.
 
-After N >= 3 repetitions the script solves and saves T_cam_to_ee.npy.
+Per repetition (minimum 3, motor placed at different spots each time):
+
+  Step 1 — Depth scan
+    Robot stays at top position.
+    Script captures depth + IR, detects motor, shows annotated IR image.
+
+  Step 2 — Visual alignment
+    A split window opens:
+      LEFT  — static IR reference with the detected motor bounding box
+      RIGHT — live RGB feed from the camera
+    Move the robot down/around until the motor in the live view matches
+    the reference box as closely as possible, then press SPACE to confirm.
+    Type in the robot coordinates for that close-up position.
+
+  Step 3 — RGB capture and grasp
+    Script captures RGB, detects centroid and orientation, shows the result.
+    Jog the robot to the exact pick position (aligned gripper to motor axis).
+    Type in the robot coordinates for that pick position.
+
+After >= 3 repetitions the script fits the transforms and saves them.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
-from typing import List, Tuple
 
 import cv2
 import numpy as np
 
 from motor_grasp_pipeline import (
     CameraInterface,
-    RobotInterface,
     detect_motor_orientation,
-    ee_pose_to_matrix,
     find_motor_in_depth,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-CALIBRATION_DIR = Path("calibration")
-CALIBRATION_DIR.mkdir(exist_ok=True)
-
-RAW_DATA_FILE = CALIBRATION_DIR / "calibration_points.json"
-T_CAM_TO_EE_FILE = CALIBRATION_DIR / "T_cam_to_ee.npy"
-
-
-# ---------------------------------------------------------------------------
-# Geometry helpers
-# ---------------------------------------------------------------------------
-
-def rigid_transform_svd(
-    src: np.ndarray,   # (N, 3)  points in source frame (camera)
-    dst: np.ndarray,   # (N, 3)  points in target frame (EE)
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Kabsch algorithm: find R (3×3), t (3,) such that R @ src[i] + t ≈ dst[i].
-    Returns (R, t).
-    """
-    assert src.shape == dst.shape and src.ndim == 2 and src.shape[1] == 3
-
-    centroid_src = src.mean(axis=0)
-    centroid_dst = dst.mean(axis=0)
-
-    A = src - centroid_src
-    B = dst - centroid_dst
-
-    H = A.T @ B
-    U, _, Vt = np.linalg.svd(H)
-
-    # Correct for reflection
-    d = np.linalg.det(Vt.T @ U.T)
-    D = np.diag([1.0, 1.0, d])
-
-    R = Vt.T @ D @ U.T
-    t = centroid_dst - R @ centroid_src
-
-    return R, t
-
-
-def reprojection_errors(
-    src: np.ndarray,
-    dst: np.ndarray,
-    R: np.ndarray,
-    t: np.ndarray,
-) -> np.ndarray:
-    """Return per-point Euclidean errors in metres."""
-    predicted = (R @ src.T).T + t
-    return np.linalg.norm(predicted - dst, axis=1)
-
-
-def build_transform(R: np.ndarray, t: np.ndarray) -> np.ndarray:
-    T = np.eye(4)
-    T[:3, :3] = R
-    T[:3, 3] = t
-    return T
+CALIB_DIR      = Path("calibration")
+RAW_DATA_FILE  = CALIB_DIR / "calibration_points.json"
+TRANSFORMS_FILE = CALIB_DIR / "transforms.json"
+DEBUG_DIR      = CALIB_DIR / "debug"
 
 
 # ---------------------------------------------------------------------------
-# Data I/O
+# Terminal helpers
 # ---------------------------------------------------------------------------
 
-def load_raw_data() -> List[dict]:
-    if RAW_DATA_FILE.exists():
-        with open(RAW_DATA_FILE) as f:
-            data = json.load(f)
-        log.info("Loaded %d existing calibration point(s) from %s", len(data), RAW_DATA_FILE)
-        return data
-    return []
-
-
-def save_raw_data(data: List[dict]):
-    with open(RAW_DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-    log.info("Saved %d calibration point(s) to %s", len(data), RAW_DATA_FILE)
-
-
-# ---------------------------------------------------------------------------
-# Interactive prompts
-# ---------------------------------------------------------------------------
-
-def prompt(msg: str):
-    """Print a clearly visible instruction and wait for Enter."""
+def prompt_enter(msg: str):
     print("\n" + "=" * 60)
-    print(f"  ACTION REQUIRED: {msg}")
+    print(f"  {msg}")
     print("=" * 60)
-    input("  Press ENTER when done…")
+    input("  Press ENTER when ready…")
 
 
-def robot_read_tcp(robot: RobotInterface) -> dict:
-    """
-    Read the current TCP pose from the robot.
-    Returns {x, y, z, rx, ry, rz} in metres / degrees.
-    STUB — replace with your robot SDK call.
-    """
-    pose = robot.get_current_pose()
-    log.info("TCP pose: %s", pose)
+def input_pose(label: str) -> dict:
+    """Prompt the user to type robot XYZ + last joint angle."""
+    print(f"\n  Enter robot coordinates for: {label}")
+    x  = float(input("    x   (m)   : ").strip())
+    y  = float(input("    y   (m)   : ").strip())
+    z  = float(input("    z   (m)   : ").strip())
+    rz = float(input("    rz  (deg) : ").strip())
+    pose = {"x": x, "y": y, "z": z, "rz": rz}
+    print(f"  Saved: {pose}")
     return pose
 
 
 # ---------------------------------------------------------------------------
-# One calibration repetition
+# Live alignment window
 # ---------------------------------------------------------------------------
 
-def collect_one_repetition(
+def live_alignment_view(
     camera: CameraInterface,
-    robot: RobotInterface,
-    rep_index: int,
-    save_debug_images: bool = True,
-) -> dict:
+    ir_reference: np.ndarray,
+    box: np.ndarray,
+) -> bool:
     """
-    Guide the user through one repetition and return a data dict with:
-      - overhead_ee_pose: robot TCP pose at the overhead position
-      - p_cam_depth: [Xc, Yc, Zc] motor in depth-camera frame (metres)
-      - rgb_ee_pose: robot TCP pose at the RGB-scan position
-      - image_angle_deg: detected orientation in the RGB image
-      - centroid_px: (u, v) centroid in RGB image
-      - grasp_ee_pose: robot TCP pose when TCP was at the motor centre
+    Show a split window:
+      LEFT  — static IR image with the detected motor bounding box
+      RIGHT — live RGB feed from the camera
+
+    The user moves the robot until the live view matches the reference,
+    then presses SPACE to confirm or Q / ESC to abort.
+
+    Returns True on confirm, False on abort.
     """
-    print(f"\n{'#'*60}")
-    print(f"  REPETITION {rep_index + 1}")
-    print(f"{'#'*60}")
+    H, W = ir_reference.shape[:2]
 
-    # ------------------------------------------------------------------
-    # STEP 1 — Overhead depth scan
-    # ------------------------------------------------------------------
-    prompt(
-        f"[Rep {rep_index+1} / Step 1] Move the robot to the FIXED OVERHEAD position "
-        "and hold it steady."
-    )
+    # Build static left panel
+    left = cv2.cvtColor(ir_reference, cv2.COLOR_GRAY2BGR)
+    cv2.drawContours(left, [box], -1, (0, 255, 0), 2)
+    cx_box = int(box[:, 0].mean())
+    cy_box = int(box[:, 1].mean())
+    cv2.circle(left, (cx_box, cy_box), 6, (0, 0, 255), -1)
+    cv2.putText(left, "IR reference (target)", (10, 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-    overhead_ee_pose = robot_read_tcp(robot)
-    T_overhead_ee_to_base = ee_pose_to_matrix(overhead_ee_pose)
-    T_overhead_base_to_ee = np.linalg.inv(T_overhead_ee_to_base)
+    cv2.namedWindow("Alignment", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Alignment", W * 2, H)
 
-    log.info("Capturing depth frame…")
-    depth_mm, ir_left = camera.capture_depth_frame(n_average=5)
+    print("\n  [ALIGNMENT WINDOW OPEN]")
+    print("  Move the robot until the motor in the live feed matches the reference box.")
+    print("  SPACE = confirm position    Q / ESC = abort\n")
 
-    detection = find_motor_in_depth(depth_mm)
-    u, v = detection["center_uv"]
-    depth_m = detection["depth_mm"] / 1000.0
+    while True:
+        frames = camera._pipeline.wait_for_frames(timeout_ms=5000)
+        color_frame = frames.get_color_frame()
+        if not color_frame:
+            continue
+        rgb = np.asanyarray(color_frame.get_data())
+        right = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        cv2.putText(right, "Live RGB  —  align motor to box", (10, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(right, "SPACE = confirm   Q = abort", (10, H - 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 1)
 
-    p_cam_depth = camera.pixel_to_camera_3d(u, v, depth_m, use_color_intrinsics=False)
-    log.info("Motor in camera frame (depth): [%.4f, %.4f, %.4f] m", *p_cam_depth)
+        cv2.imshow("Alignment", np.hstack([left, right]))
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord(" "):
+            cv2.destroyWindow("Alignment")
+            return True
+        if key in (ord("q"), ord("Q"), 27):
+            cv2.destroyWindow("Alignment")
+            return False
 
-    if save_debug_images:
-        _save_debug_depth(ir_left, depth_mm, detection, rep_index, u, v)
 
-    # ------------------------------------------------------------------
-    # STEP 2 — RGB scan (close-up, for orientation cross-check)
-    # ------------------------------------------------------------------
-    prompt(
-        f"[Rep {rep_index+1} / Step 2] Move the robot to the CLOSE-UP RGB position "
-        "(directly above the motor at your chosen RGB scan height)."
-    )
+# ---------------------------------------------------------------------------
+# Annotation display
+# ---------------------------------------------------------------------------
 
-    rgb_ee_pose = robot_read_tcp(robot)
+def show_rgb_detection(
+    color_bgr: np.ndarray,
+    cx: float,
+    cy: float,
+    angle: float,
+    rep: int,
+):
+    """Show the RGB image annotated with centroid and orientation arrow."""
+    vis = color_bgr.copy()
+    cxi, cyi = int(round(cx)), int(round(cy))
+    length = 80
+    dx = int(length * np.cos(np.radians(angle)))
+    dy = int(length * np.sin(np.radians(angle)))
+    cv2.arrowedLine(vis, (cxi - dx, cyi - dy), (cxi + dx, cyi + dy),
+                    (0, 220, 255), 3, tipLength=0.15)
+    cv2.circle(vis, (cxi, cyi), 8, (255, 0, 0), -1)
+    cv2.putText(vis, f"Rep {rep}   angle={angle:.1f} deg   centroid=({cx:.0f}, {cy:.0f})",
+                (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 220, 255), 2)
+    cv2.putText(vis, "Press any key to continue", (10, 58),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.60, (200, 200, 200), 2)
+    cv2.imshow("RGB Detection", vis)
+    cv2.waitKey(0)
+    cv2.destroyWindow("RGB Detection")
 
-    log.info("Capturing RGB frame…")
-    color_rgb, depth_aligned = camera.capture_rgb_frame(n_average=3)
-    color_bgr = cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR)
 
-    image_angle_deg, (cx_px, cy_px) = detect_motor_orientation(color_bgr)
-    log.info("Orientation in RGB image: %.1f°, centroid px=(%.1f, %.1f)",
-             image_angle_deg, cx_px, cy_px)
+# ---------------------------------------------------------------------------
+# Transform fitting
+# ---------------------------------------------------------------------------
 
-    if save_debug_images:
-        _save_debug_rgb(color_bgr, cx_px, cy_px, image_angle_deg, rep_index)
+def fit_affine_2d(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
+    """
+    Fit a 2-D affine transform M (2×3) from src (N,2) to dst (N,2).
 
-    # ------------------------------------------------------------------
-    # STEP 3 — Manual grasp point (ground truth)
-    # ------------------------------------------------------------------
-    prompt(
-        f"[Rep {rep_index+1} / Step 3] JOG the robot TCP to the EXACT CENTRE of the motor "
-        "at table height (the point where the gripper would close on the motor). "
-        "Make sure the TCP is at the motor centre, not the surface — "
-        "typically the midpoint of the motor thickness."
-    )
+    dst ≈ M @ [src_x, src_y, 1].T
 
-    grasp_ee_pose = robot_read_tcp(robot)
-    p_grasp_robot = np.array([grasp_ee_pose["x"],
-                               grasp_ee_pose["y"],
-                               grasp_ee_pose["z"]])
-    log.info("Grasp point in robot frame: [%.4f, %.4f, %.4f] m", *p_grasp_robot)
+    For N=3: exact solution. For N>3: least squares.
+    """
+    N = len(src)
+    A = np.zeros((2 * N, 6))
+    b = np.zeros(2 * N)
+    for i, (s, d) in enumerate(zip(src, dst)):
+        A[2 * i,     :3] = [s[0], s[1], 1.0]
+        A[2 * i + 1, 3:] = [s[0], s[1], 1.0]
+        b[2 * i]     = d[0]
+        b[2 * i + 1] = d[1]
+    params, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+    return np.array([[params[0], params[1], params[2]],
+                     [params[3], params[4], params[5]]])
 
-    # q_i = T_base_to_ee_overhead @ p_grasp_robot  (target in EE frame)
-    p_grasp_h  = np.array([*p_grasp_robot, 1.0])
-    q_in_ee    = (T_overhead_base_to_ee @ p_grasp_h)[:3]
+
+def apply_affine_2d(M: np.ndarray, pt) -> np.ndarray:
+    """Apply a 2×3 affine matrix to a 2-D point. Returns [x, y]."""
+    return M @ np.array([pt[0], pt[1], 1.0])
+
+
+def circular_mean_deg(angles: list[float]) -> float:
+    """Mean of a list of angles (degrees), handling wrap-around."""
+    sin_m = np.mean([np.sin(np.radians(a)) for a in angles])
+    cos_m = np.mean([np.cos(np.radians(a)) for a in angles])
+    return float(np.degrees(np.arctan2(sin_m, cos_m)) % 360)
+
+
+def solve_transforms(reps: list[dict]) -> dict:
+    """
+    Fit all transforms from the collected repetition data.
+
+    Returns a dict ready to be saved as transforms.json.
+    """
+    depth_src  = np.array([[r["depth_centroid_px"][0],
+                             r["depth_centroid_px"][1]] for r in reps])
+    closeup_dst = np.array([[r["closeup_pose"]["x"],
+                              r["closeup_pose"]["y"]] for r in reps])
+
+    rgb_src   = np.array([[r["rgb_centroid_px"][0],
+                            r["rgb_centroid_px"][1]] for r in reps])
+    pick_dst  = np.array([[r["pick_pose"]["x"],
+                            r["pick_pose"]["y"]] for r in reps])
+
+    T_depth = fit_affine_2d(depth_src, closeup_dst)
+    T_rgb   = fit_affine_2d(rgb_src,   pick_dst)
+
+    # Angle offset: pick_rz - image_angle (circular, averaged)
+    angle_offsets = [(r["pick_pose"]["rz"] - r["image_angle_deg"]) % 360
+                     for r in reps]
+    angle_offset = circular_mean_deg(angle_offsets)
+
+    closeup_z = float(np.mean([r["closeup_pose"]["z"] for r in reps]))
+    grasp_z   = float(np.mean([r["pick_pose"]["z"]    for r in reps]))
 
     return {
-        "rep": rep_index + 1,
-        # raw data (serialisable)
-        "overhead_ee_pose": overhead_ee_pose,
-        "p_cam_depth": p_cam_depth.tolist(),
-        "depth_mm": float(detection["depth_mm"]),
-        "depth_center_uv": [float(u), float(v)],
-        "rgb_ee_pose": rgb_ee_pose,
-        "image_angle_deg": float(image_angle_deg),
-        "centroid_px": [float(cx_px), float(cy_px)],
-        "grasp_ee_pose": grasp_ee_pose,
-        # derived (also serialised for transparency)
-        "p_grasp_robot": p_grasp_robot.tolist(),
-        "q_in_ee": q_in_ee.tolist(),
+        "T_depth_to_closeup_xy": T_depth.tolist(),   # 2×3 matrix
+        "T_rgb_to_grasp_xy":     T_rgb.tolist(),      # 2×3 matrix
+        "angle_offset_deg":      angle_offset,
+        "closeup_z":             closeup_z,
+        "grasp_z":               grasp_z,
     }
 
 
-# ---------------------------------------------------------------------------
-# Solver
-# ---------------------------------------------------------------------------
+def print_validation(reps: list[dict], transforms: dict):
+    """Print per-rep reprojection errors for a quick sanity check."""
+    T_d = np.array(transforms["T_depth_to_closeup_xy"])
+    T_r = np.array(transforms["T_rgb_to_grasp_xy"])
+    ang_off = transforms["angle_offset_deg"]
 
-def solve_hand_eye(data: List[dict]) -> np.ndarray:
-    """
-    Given N >= 3 calibration repetitions, solve for T_cam_to_ee (4×4).
+    print()
+    for r in reps:
+        pred_cu  = apply_affine_2d(T_d, r["depth_centroid_px"])
+        act_cu   = np.array([r["closeup_pose"]["x"], r["closeup_pose"]["y"]])
+        err_cu   = np.linalg.norm(pred_cu - act_cu) * 1000
 
-    At each rep i:
-      p_cam_i  = motor in depth-camera frame (from depth backprojection)
-      q_i      = motor in EE frame at overhead pose = T_base_to_ee_i @ p_grasp_i
+        pred_gr  = apply_affine_2d(T_r, r["rgb_centroid_px"])
+        act_gr   = np.array([r["pick_pose"]["x"], r["pick_pose"]["y"]])
+        err_gr   = np.linalg.norm(pred_gr - act_gr) * 1000
 
-    Find R, t such that  R @ p_cam_i + t ≈ q_i  for all i.
-    """
-    if len(data) < 3:
-        raise ValueError(f"Need at least 3 repetitions, got {len(data)}.")
+        pred_ang = (r["image_angle_deg"] + ang_off) % 360
+        err_ang  = abs((pred_ang - r["pick_pose"]["rz"] + 180) % 360 - 180)
 
-    p_cam = np.array([d["p_cam_depth"] for d in data], dtype=np.float64)  # (N, 3)
-    q_ee  = np.array([d["q_in_ee"]     for d in data], dtype=np.float64)  # (N, 3)
-
-    R, t = rigid_transform_svd(p_cam, q_ee)
-
-    errors = reprojection_errors(p_cam, q_ee, R, t)
-    log.info("Hand-eye solve: %d points, RMS error = %.4f m, max = %.4f m",
-             len(data), float(np.sqrt(np.mean(errors**2))), float(errors.max()))
-    for i, (e, d) in enumerate(zip(errors, data)):
-        log.info("  Rep %d: error = %.4f m", d["rep"], e)
-
-    T = build_transform(R, t)
-    return T
-
-
-def estimate_mounting_offset(data: List[dict]) -> float:
-    """
-    Estimate mounting_offset_deg from the saved repetitions.
-    At each rep we know:
-      - image_angle_deg: motor orientation in the RGB image
-      - The motor's true orientation in robot frame can be approximated from
-        the grasp TCP's rz (the operator aligned the gripper to the motor).
-    Returns the mean offset in degrees.
-    If the operator did NOT align the gripper during the grasp step, skip this.
-    """
-    offsets = []
-    for d in data:
-        grasp_rz    = d["grasp_ee_pose"].get("rz", 0.0)  # robot tool yaw at grasp
-        rgb_rz      = d["rgb_ee_pose"].get("rz", 0.0)    # robot tool yaw at RGB scan
-        image_angle = d["image_angle_deg"]
-        # Angle of motor in robot frame (approximate) = grasp tool yaw
-        # Angle of motor in image = image_angle_deg
-        # offset = robot_angle - image_angle - current_tool_yaw_at_RGB_scan
-        offset = (grasp_rz - image_angle - rgb_rz) % 360
-        if offset > 180:
-            offset -= 360
-        offsets.append(offset)
-        log.info("  Rep %d: image_angle=%.1f° grasp_rz=%.1f° → offset=%.1f°",
-                 d["rep"], image_angle, grasp_rz, offset)
-    mean_offset = float(np.mean(offsets))
-    log.info("Estimated mounting_offset_deg: %.1f°", mean_offset)
-    return mean_offset
+        print(f"  Rep {r['rep']}:  close-up err={err_cu:5.1f} mm  "
+              f"grasp err={err_gr:5.1f} mm  angle err={err_ang:4.1f}°")
 
 
 # ---------------------------------------------------------------------------
-# Debug image helpers
+# One repetition
 # ---------------------------------------------------------------------------
 
-def _save_debug_depth(ir_left, depth_mm, detection, rep_index, u, v):
-    os.makedirs("calibration/debug", exist_ok=True)
-    vis = cv2.cvtColor(ir_left, cv2.COLOR_GRAY2BGR)
-    cv2.drawContours(vis, [detection["box"]], -1, (0, 255, 0), 3)
-    x, y, w, h = detection["roi"]
-    cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 200, 255), 2)
-    cv2.circle(vis, (int(u), int(v)), 10, (0, 0, 255), -1)
-    cv2.putText(vis, f"Rep {rep_index+1} depth", (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-    path = f"calibration/debug/rep{rep_index+1}_phase1_depth.png"
-    cv2.imwrite(path, vis)
-    log.info("Saved %s", path)
+def collect_one_rep(camera: CameraInterface, rep_index: int) -> dict:
+    print(f"\n{'#' * 60}\n  REPETITION {rep_index + 1}\n{'#' * 60}")
 
+    # ------------------------------------------------------------------
+    # Step 1: depth scan from top position
+    # ------------------------------------------------------------------
+    prompt_enter(
+        f"[Rep {rep_index + 1} / Step 1]  Move the motor to a NEW position on the table.\n"
+        "  Then move the robot to the FIXED TOP POSITION and hold steady."
+    )
 
-def _save_debug_rgb(color_bgr, cx_px, cy_px, angle_deg, rep_index):
-    os.makedirs("calibration/debug", exist_ok=True)
-    vis = color_bgr.copy()
-    cx, cy = int(round(cx_px)), int(round(cy_px))
-    length = 80
-    dx = int(length * np.cos(np.radians(angle_deg)))
-    dy = int(length * np.sin(np.radians(angle_deg)))
-    cv2.arrowedLine(vis, (cx - dx, cy - dy), (cx + dx, cy + dy),
+    log.info("Capturing depth + IR…")
+    depth_mm, ir_left = camera.capture_depth_frame(n_average=5)
+    detection = find_motor_in_depth(depth_mm)
+    u, v = detection["center_uv"]
+    log.info("Motor detected at pixel (%.1f, %.1f), depth=%.0f mm", u, v, detection["depth_mm"])
+
+    # Save depth debug image
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    vis_depth = cv2.cvtColor(ir_left, cv2.COLOR_GRAY2BGR)
+    cv2.drawContours(vis_depth, [detection["box"]], -1, (0, 255, 0), 2)
+    cv2.circle(vis_depth, (int(u), int(v)), 8, (0, 0, 255), -1)
+    depth_debug_path = str(DEBUG_DIR / f"rep{rep_index + 1}_depth.png")
+    cv2.imwrite(depth_debug_path, vis_depth)
+    log.info("Depth debug image saved: %s", depth_debug_path)
+
+    # ------------------------------------------------------------------
+    # Step 2: visual alignment + type close-up coordinates
+    # ------------------------------------------------------------------
+    prompt_enter(
+        f"[Rep {rep_index + 1} / Step 2]  The alignment window will open.\n"
+        "  Move the robot down toward the motor.\n"
+        "  Adjust position until the motor in the live RGB view matches\n"
+        "  the bounding box shown in the IR reference panel.\n"
+        "  Press SPACE in the window to confirm."
+    )
+
+    confirmed = live_alignment_view(camera, ir_left, detection["box"])
+    if not confirmed:
+        raise RuntimeError("Alignment aborted.")
+
+    closeup_pose = input_pose(f"close-up position (rep {rep_index + 1})")
+
+    # ------------------------------------------------------------------
+    # Step 3: RGB capture, orientation, then jog to pick
+    # ------------------------------------------------------------------
+    log.info("Capturing RGB frame…")
+    color_rgb, _ = camera.capture_rgb_frame(n_average=3)
+    color_bgr = cv2.cvtColor(color_rgb, cv2.COLOR_RGB2BGR)
+
+    image_angle, (cx, cy) = detect_motor_orientation(color_bgr)
+    log.info("Orientation: %.1f°   centroid: (%.1f, %.1f)", image_angle, cx, cy)
+
+    show_rgb_detection(color_bgr, cx, cy, image_angle, rep_index + 1)
+
+    # Save RGB debug image
+    rgb_debug_path = str(DEBUG_DIR / f"rep{rep_index + 1}_rgb.png")
+    annotated = color_bgr.copy()
+    cxi, cyi = int(round(cx)), int(round(cy))
+    dx = int(80 * np.cos(np.radians(image_angle)))
+    dy = int(80 * np.sin(np.radians(image_angle)))
+    cv2.arrowedLine(annotated, (cxi - dx, cyi - dy), (cxi + dx, cyi + dy),
                     (0, 220, 255), 3, tipLength=0.15)
-    cv2.circle(vis, (cx, cy), 8, (255, 0, 0), -1)
-    cv2.putText(vis, f"Rep {rep_index+1}  {angle_deg:.1f} deg", (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 220, 255), 2)
-    path = f"calibration/debug/rep{rep_index+1}_phase2_rgb.png"
-    cv2.imwrite(path, vis)
-    log.info("Saved %s", path)
+    cv2.circle(annotated, (cxi, cyi), 8, (255, 0, 0), -1)
+    cv2.imwrite(rgb_debug_path, annotated)
+    log.info("RGB debug image saved: %s", rgb_debug_path)
+
+    prompt_enter(
+        f"[Rep {rep_index + 1} / Step 3]  Jog the robot to the PICK POSITION.\n"
+        "  Position the TCP at the motor centre at grasp height.\n"
+        "  Rotate the last joint so the gripper aligns with the motor's long axis.\n"
+        f"  (Detected motor angle in image: {image_angle:.1f}°)"
+    )
+
+    pick_pose = input_pose(f"pick position (rep {rep_index + 1})")
+
+    return {
+        "rep":               rep_index + 1,
+        "depth_centroid_px": [float(u), float(v)],
+        "depth_mm":          float(detection["depth_mm"]),
+        "closeup_pose":      closeup_pose,
+        "rgb_centroid_px":   [float(cx), float(cy)],
+        "image_angle_deg":   float(image_angle),
+        "pick_pose":         pick_pose,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -364,102 +373,84 @@ def _save_debug_rgb(color_bgr, cx_px, cy_px, angle_deg, rep_index):
 def main():
     print("""
 ╔══════════════════════════════════════════════════════════╗
-║          Motor Grasp Pipeline — Calibration              ║
+║       Motor Grasp Pipeline — Manual Calibration          ║
 ╠══════════════════════════════════════════════════════════╣
-║  You will be guided through 3–6 repetitions.             ║
-║  Each repetition:                                        ║
-║    Step 1 — Robot to overhead position (depth scan)      ║
-║    Step 2 — Robot to close-up position (RGB scan)        ║
-║    Step 3 — Jog TCP to exact motor centre (ground truth) ║
+║  No robot SDK required.                                  ║
+║  All robot coordinates are entered manually.             ║
+║                                                          ║
+║  Per repetition (min 3, motor in different positions):   ║
+║    Step 1 — Top position → depth scan                    ║
+║    Step 2 — Live alignment view → type close-up coords   ║
+║    Step 3 — Capture RGB → jog to pick → type coords      ║
 ╚══════════════════════════════════════════════════════════╝
 """)
+
+    CALIB_DIR.mkdir(exist_ok=True)
 
     n_reps = int(input("How many repetitions? (min 3, recommended 5): ").strip() or "3")
     if n_reps < 3:
         print("Need at least 3. Setting to 3.")
         n_reps = 3
 
-    # Load any previously saved points (allows resuming after a crash)
-    data = load_raw_data()
-    already_done = len(data)
-    if already_done:
-        cont = input(f"Found {already_done} existing point(s). Continue from there? [Y/n]: ").strip().lower()
-        if cont == "n":
-            data = []
-            already_done = 0
+    # --- Save top position once ---
+    prompt_enter(
+        "Move the robot to the FIXED TOP POSITION used for all depth scans.\n"
+        "  This is the overhead position — always the same for every run."
+    )
+    top_pose = input_pose("fixed top position")
 
+    # --- Resume support ---
+    reps: list[dict] = []
+    if RAW_DATA_FILE.exists():
+        with open(RAW_DATA_FILE) as f:
+            saved = json.load(f)
+        if saved.get("reps"):
+            ans = input(f"\nFound {len(saved['reps'])} saved rep(s). Resume? [Y/n]: ").strip().lower()
+            if ans != "n":
+                reps     = saved["reps"]
+                top_pose = saved.get("top_pose", top_pose)
+                print(f"Resuming from rep {len(reps) + 1}.")
+
+    # --- Collect repetitions ---
     camera = CameraInterface()
-    robot  = RobotInterface()
-
     try:
         camera.start()
 
-        for i in range(already_done, n_reps):
-            rep_data = collect_one_repetition(camera, robot, rep_index=i)
-            data.append(rep_data)
-            save_raw_data(data)  # save after each rep so nothing is lost on crash
+        for i in range(len(reps), n_reps):
+            rep_data = collect_one_rep(camera, i)
+            reps.append(rep_data)
+            with open(RAW_DATA_FILE, "w") as f:
+                json.dump({"top_pose": top_pose, "reps": reps}, f, indent=2)
+            log.info("Rep %d saved to %s", i + 1, RAW_DATA_FILE)
 
     finally:
         camera.stop()
 
-    # ------------------------------------------------------------------
-    # Solve
-    # ------------------------------------------------------------------
+    # --- Solve ---
     print("\n" + "=" * 60)
-    print("  SOLVING for T_cam_to_ee…")
+    print("  COMPUTING TRANSFORMS")
     print("=" * 60)
 
-    T_cam_to_ee = solve_hand_eye(data)
+    transforms = solve_transforms(reps)
+    transforms["top_pose"] = top_pose
+    transforms["n_reps"]   = len(reps)
 
-    print("\nT_cam_to_ee (camera → end-effector):")
-    print(np.array2string(T_cam_to_ee, precision=6, suppress_small=True))
+    with open(TRANSFORMS_FILE, "w") as f:
+        json.dump(transforms, f, indent=2)
 
-    np.save(str(T_CAM_TO_EE_FILE), T_cam_to_ee)
-    print(f"\nSaved to {T_CAM_TO_EE_FILE}")
+    print(f"\n  angle_offset_deg : {transforms['angle_offset_deg']:.1f}°")
+    print(f"  closeup_z        : {transforms['closeup_z']:.4f} m")
+    print(f"  grasp_z          : {transforms['grasp_z']:.4f} m")
 
-    # ------------------------------------------------------------------
-    # Mounting offset for angle mapping
-    # ------------------------------------------------------------------
+    # --- Validation ---
     print("\n" + "=" * 60)
-    print("  ESTIMATING mounting_offset_deg…")
+    print("  VALIDATION — reprojection errors (should be 0 with N=3 reps)")
     print("=" * 60)
-    print("NOTE: This is only valid if during Step 3 (jog to grasp point)")
-    print("you also ROTATED the gripper to align with the motor's long axis.")
-    print()
-    do_offset = input("Did you align the gripper rotation during Step 3? [y/N]: ").strip().lower()
-    if do_offset == "y":
-        offset = estimate_mounting_offset(data)
-        print(f"\nmounting_offset_deg = {offset:.1f}°")
-        print("Update this value in motor_grasp_pipeline.py → _image_angle_to_robot_angle()")
-    else:
-        print("Skipping mounting offset estimation. Use the manual method in CALIBRATION.md.")
+    print_validation(reps, transforms)
 
-    # ------------------------------------------------------------------
-    # Quick validation summary
-    # ------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("  VALIDATION SUMMARY")
-    print("=" * 60)
-    p_cam = np.array([d["p_cam_depth"] for d in data])
-    q_ee  = np.array([d["q_in_ee"]     for d in data])
-    R = T_cam_to_ee[:3, :3]
-    t = T_cam_to_ee[:3, 3]
-    from motor_grasp_pipeline import camera_point_to_robot, ee_pose_to_matrix
-    for d in data:
-        T_ee_to_base = ee_pose_to_matrix(d["overhead_ee_pose"])
-        p_predicted = camera_point_to_robot(
-            np.array(d["p_cam_depth"]), T_cam_to_ee, T_ee_to_base
-        )
-        p_actual = np.array(d["p_grasp_robot"])
-        err_m = np.linalg.norm(p_predicted - p_actual)
-        print(f"  Rep {d['rep']}: predicted=[{p_predicted[0]:.4f}, {p_predicted[1]:.4f}, "
-              f"{p_predicted[2]:.4f}] m  |  actual=[{p_actual[0]:.4f}, {p_actual[1]:.4f}, "
-              f"{p_actual[2]:.4f}] m  |  error={err_m*1000:.1f} mm")
-
-    print("\nCalibration complete!")
-    print(f"  T_cam_to_ee saved → {T_CAM_TO_EE_FILE}")
-    print(f"  Raw data saved    → {RAW_DATA_FILE}")
-    print("\nNext: run motor_grasp_pipeline.py to test the full pipeline.")
+    print(f"\n  Raw data   → {RAW_DATA_FILE}")
+    print(f"  Transforms → {TRANSFORMS_FILE}")
+    print("\nCalibration complete. Load transforms.json in motor_grasp_pipeline.py.")
 
 
 if __name__ == "__main__":
